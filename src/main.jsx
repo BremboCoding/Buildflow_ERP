@@ -18,7 +18,7 @@ const menuGroups = [
   { label: 'โครงการ', items: [{ name: 'โครงการทั้งหมด', icon: Building2 }, { name: 'แบบบ้าน', icon: House }] },
   { label: 'ออกแบบ', items: [{ name: 'Structure 3D', icon: Box }, { name: 'Blueprint', icon: FileText }, { name: 'CAD Viewer', icon: Monitor }] },
   { label: 'งานระบบ & อุปกรณ์', items: [{ name: 'ไฟฟ้า', icon: Zap }, { name: 'ประปา & สุขภัณฑ์', icon: Droplets }, { name: 'ปรับอากาศ', icon: Wind }, { name: 'อุปกรณ์อาคาร', icon: Settings }] },
-  { label: 'งานปฏิบัติการ', items: [{ name: 'การตรวจสอบ', icon: ClipboardCheck }, { name: 'แจ้งซ่อม/ปัญหา', icon: AlertTriangle }, { name: 'ใบสั่งงาน', icon: ClipboardList }, { name: 'บำรุงรักษา', icon: Wrench }] },
+  { label: 'งานปฏิบัติการ', items: [{ name: 'การตรวจสอบ', icon: ClipboardCheck }, { name: 'บิลเบิกจ่าย', icon: Wallet }, { name: 'ใบสั่งงาน', icon: ClipboardList }, { name: 'บำรุงรักษา', icon: Wrench }] },
   { label: 'ข้อมูล', items: [{ name: 'รายงาน', icon: BarChart3 }, { name: 'เอกสาร', icon: Folder }] }
 ];
 
@@ -26,6 +26,65 @@ const initialProjects = [
 ];
 
 const PROJECTS_STORAGE_KEY = 'buildflow_projects';
+const DISBURSEMENTS_STORAGE_KEY = 'buildflow_disbursements';
+
+function loadDisbursements() {
+  try {
+    const saved = window.localStorage.getItem(DISBURSEMENTS_STORAGE_KEY);
+    if (!saved) return [];
+    const disbursements = JSON.parse(saved);
+    return Array.isArray(disbursements) ? disbursements : [];
+  } catch {
+    return [];
+  }
+}
+
+function localDateInput() {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function compressSlipImage(file) {
+  return new Promise((resolve, reject) => {
+    const imageUrl = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(imageUrl);
+      const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(image.naturalWidth * scale);
+      canvas.height = Math.round(image.naturalHeight * scale);
+      const context = canvas.getContext('2d');
+      if (!context) {
+        reject(new Error('ไม่สามารถประมวลผลรูปภาพได้'));
+        return;
+      }
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        if (!blob) {
+          reject(new Error('ไม่สามารถแปลงรูปภาพได้'));
+          return;
+        }
+        if (blob.size > 1_500_000) {
+          reject(new Error('ไฟล์สลิปมีขนาดใหญ่เกินไป กรุณาใช้รูปที่มีขนาดเล็กลง'));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('อ่านรูปภาพไม่สำเร็จ'));
+        reader.readAsDataURL(blob);
+      }, 'image/jpeg', 0.8);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(imageUrl);
+      reject(new Error('ไฟล์นี้ไม่สามารถเปิดเป็นรูปภาพได้'));
+    };
+    image.src = imageUrl;
+  });
+}
 
 function loadProjects() {
   try {
@@ -40,7 +99,7 @@ function loadProjects() {
         ? project.budgetAmount
         : contractAmount;
       const disbursedAmount = typeof project.disbursedAmount === 'number'
-        ? Math.min(project.disbursedAmount, budgetAmount)
+        ? project.disbursedAmount
         : 0;
       return {
         ...project,
@@ -74,8 +133,6 @@ function parseAmount(value) {
 
 const trend = [];
 const statusData = [];
-const repairs = [];
-
 function App() {
   const [active, setActive] = useState('Dashboard');
   const [query, setQuery] = useState('');
@@ -83,7 +140,12 @@ function App() {
   const [showProfile, setShowProfile] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [projects, setProjects] = useState(loadProjects);
+  const [disbursements, setDisbursements] = useState(loadDisbursements);
+  const [showDisbursementCreate, setShowDisbursementCreate] = useState(false);
   const [editingProject, setEditingProject] = useState(null);
+  const [editingDisbursement, setEditingDisbursement] = useState(null);
+  const [slipDraft, setSlipDraft] = useState('');
+  const [isSlipProcessing, setIsSlipProcessing] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [range, setRange] = useState('12 เดือน');
   const [toast, setToast] = useState('');
@@ -96,12 +158,24 @@ function App() {
   }, [projects]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(DISBURSEMENTS_STORAGE_KEY, JSON.stringify(disbursements));
+    } catch {
+      notify('บันทึกบิลไม่สำเร็จ พื้นที่จัดเก็บในเบราว์เซอร์อาจเต็ม');
+    }
+  }, [disbursements]);
+
+  useEffect(() => {
     const syncProjects = (event) => {
-      if (event.key !== PROJECTS_STORAGE_KEY) return;
       try {
-        setProjects(event.newValue ? JSON.parse(event.newValue) : []);
+        if (event.key === PROJECTS_STORAGE_KEY) {
+          setProjects(event.newValue ? JSON.parse(event.newValue) : []);
+        } else if (event.key === DISBURSEMENTS_STORAGE_KEY) {
+          setDisbursements(event.newValue ? JSON.parse(event.newValue) : []);
+        }
       } catch {
-        setProjects(initialProjects);
+        if (event.key === PROJECTS_STORAGE_KEY) setProjects(initialProjects);
+        if (event.key === DISBURSEMENTS_STORAGE_KEY) setDisbursements([]);
       }
     };
     window.addEventListener('storage', syncProjects);
@@ -152,6 +226,18 @@ function App() {
     };
   }, [projects]);
 
+  const latestDisbursements = useMemo(() => disbursements
+    .slice(-4)
+    .reverse()
+    .map(bill => {
+      const project = projects.find(item => item.id === bill.projectId);
+      return {
+        ...bill,
+        project: project?.name || bill.projectName,
+        remaining: project ? (project.budgetAmount || 0) - (project.disbursedAmount || 0) : 0
+      };
+    }), [disbursements, projects]);
+
   const notify = (msg) => { setToast(msg); window.setTimeout(() => setToast(''), 2600); };
   const openCreate = () => {
     setEditingProject(null);
@@ -170,6 +256,80 @@ function App() {
     setEditingProject(null);
     setBudgetDraft('');
     setDisbursedDraft('');
+  };
+  const openDisbursementCreate = () => {
+    setEditingDisbursement(null);
+    setSlipDraft('');
+    setShowDisbursementCreate(true);
+  };
+  const openDisbursementEdit = (bill) => {
+    setEditingDisbursement(bill);
+    setSlipDraft(bill.slipDataUrl || '');
+    setShowDisbursementCreate(true);
+  };
+  const closeDisbursementModal = () => {
+    setShowDisbursementCreate(false);
+    setEditingDisbursement(null);
+    setSlipDraft('');
+  };
+  const handleSlipUpload = async (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      input.value = '';
+      notify('กรุณาเลือกไฟล์รูปภาพ');
+      return;
+    }
+    if (file.size > 12_000_000) {
+      input.value = '';
+      notify('ไฟล์ต้นฉบับมีขนาดใหญ่เกินไป (สูงสุด 12 MB)');
+      return;
+    }
+    setIsSlipProcessing(true);
+    try {
+      setSlipDraft(await compressSlipImage(file));
+    } catch (error) {
+      input.value = '';
+      notify(error instanceof Error ? error.message : 'อัปโหลดรูปภาพไม่สำเร็จ');
+    } finally {
+      setIsSlipProcessing(false);
+    }
+  };
+  const saveDisbursement = (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const projectId = form.get('projectId');
+    const amount = parseAmount(form.get('amount'));
+    const project = projects.find(item => item.id === projectId);
+    if (!project || amount <= 0) {
+      notify('กรุณาเลือกโครงการและระบุยอดเบิกจ่ายให้ถูกต้อง');
+      return;
+    }
+
+    const bill = {
+      id: editingDisbursement?.id || `BL-${Date.now()}`,
+      projectId: project.id,
+      projectName: project.name,
+      amount,
+      reference: String(form.get('reference') || '').trim(),
+      date: String(form.get('date') || ''),
+      slipDataUrl: slipDraft
+    };
+    setDisbursements(current => editingDisbursement
+      ? current.map(item => item.id === editingDisbursement.id ? bill : item)
+      : [...current, bill]);
+    setProjects(current => current.map(item => {
+      let change = 0;
+      if (editingDisbursement?.projectId === item.id) change -= Number(editingDisbursement.amount) || 0;
+      if (project.id === item.id) change += amount;
+      if (change === 0) return item;
+      const disbursedAmount = Math.max(0, (Number(item.disbursedAmount) || 0) + change);
+      const budgetAmount = Number(item.budgetAmount) || 0;
+      return { ...item, disbursedAmount, remainingBudget: budgetAmount - disbursedAmount };
+    }));
+    closeDisbursementModal();
+    notify(editingDisbursement ? 'แก้ไขบิลเบิกจ่ายเรียบร้อย' : 'เพิ่มบิลเบิกจ่ายเรียบร้อย');
   };
   const deleteProject = (project) => {
     if (!window.confirm(`ยืนยันการลบโครงการ "${project.name}" หรือไม่?`)) return;
@@ -268,7 +428,7 @@ function App() {
           </div>
           <div className="heading-actions">
             <button className="btn btn-light" onClick={() => window.print()}><Printer size={16}/> พิมพ์สรุป</button>
-            <button className="btn btn-light" onClick={() => setActive('แจ้งซ่อม/ปัญหา')}><AlertTriangle size={16}/> แจ้งซ่อม</button>
+            <button className="btn btn-light" onClick={() => setActive('บิลเบิกจ่าย')}><Wallet size={16}/> บิลเบิกจ่าย</button>
             <button className="btn btn-primary" onClick={openCreate}><Plus size={17}/> สร้างโครงการ</button>
           </div>
         </div>
@@ -315,10 +475,10 @@ function App() {
             </div>
             <div className="panel status-panel">
               <div className="panel-header"><div className="panel-title"><div className="panel-icon"><Clock3 size={17}/></div><div><h2>สถานะโครงการ</h2><p>{projects.length ? 'อัปเดตตามโครงการล่าสุด' : 'ยังไม่มีข้อมูลโครงการ'}</p></div></div><button className="text-link" onClick={() => setActive('โครงการทั้งหมด')}>ทั้งหมด <ArrowUpRight size={14}/></button></div>
-              <div className="donut-wrap" style={{background: projects.length ? `conic-gradient(#8057bb 0 ${dashboardStats.statusCounts[0].count / projects.length * 100}%, #c69a3b ${dashboardStats.statusCounts[0].count / projects.length * 100}% ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count) / projects.length * 100}%, #2787b0 ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count) / projects.length * 100}% ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count + dashboardStats.statusCounts[2].count) / projects.length * 100}%, #1aae7d ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count + dashboardStats.statusCounts[2].count) / projects.length * 100}% 100%)` : '#edf0f3'}}><div className="donut-center"><strong>{projects.length}</strong><span>โครงการ</span></div></div>
+              <div className="donut-wrap" style={{background: projects.length ? `conic-gradient(#64748b 0 ${dashboardStats.statusCounts[0].count / projects.length * 100}%, #c69a3b ${dashboardStats.statusCounts[0].count / projects.length * 100}% ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count) / projects.length * 100}%, #2787b0 ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count) / projects.length * 100}% ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count + dashboardStats.statusCounts[2].count) / projects.length * 100}%, #1aae7d ${(dashboardStats.statusCounts[0].count + dashboardStats.statusCounts[1].count + dashboardStats.statusCounts[2].count) / projects.length * 100}% 100%)` : '#edf0f3'}}><div className="donut-center"><strong>{projects.length}</strong><span>โครงการ</span></div></div>
               <div className="status-list">
                 {[
-                  ['วางแผน', '#8057bb'],
+                  ['วางแผน', '#64748b'],
                   ['กำลังก่อสร้าง', '#c69a3b'],
                   ['รอตรวจรับ', '#2787b0'],
                   ['ส่งมอบแล้ว', '#1aae7d']
@@ -336,13 +496,25 @@ function App() {
               <ProjectTable rows={filteredProjects.slice(0,4)} onEdit={openEdit} onDelete={deleteProject}/>
             </div>
             <div className="panel repairs-panel">
-              <div className="panel-header"><div className="panel-title"><div className="panel-icon"><Wrench size={17}/></div><div><h2>งานแจ้งซ่อมล่าสุด</h2><p>รายการที่ต้องติดตาม</p></div></div><button className="text-link" onClick={()=>setActive('แจ้งซ่อม/ปัญหา')}>ดูทั้งหมด <ArrowUpRight size={14}/></button></div>
-              <div className="repair-list">{repairs.map(r=><div className="repair-item" key={r.id}><div className="repair-symbol"><Wrench size={16}/></div><div className="repair-detail"><strong>{r.title}</strong><small>{r.id} · {r.project}</small><span>{r.age}</span></div><em className={r.priority==='เร่งด่วน'?'urgent':'normal'}>{r.priority}</em></div>)}</div>
+              <div className="panel-header"><div className="panel-title"><div className="panel-icon"><Wallet size={17}/></div><div><h2>บิลเบิกจ่ายล่าสุด</h2><p>รายการเบิกจ่ายโครงการล่าสุด</p></div></div><button className="text-link" onClick={()=>setActive('โครงการทั้งหมด')}>ดูทั้งหมด <ArrowUpRight size={14}/></button></div>
+              <div className="repair-list">
+                {latestDisbursements.length ? latestDisbursements.map(bill =>
+                  <div className="repair-item" key={bill.id}>
+                    <div className="repair-symbol"><Wallet size={16}/></div>
+                    <div className="repair-detail"><strong>{bill.project}</strong><small>{bill.id} · {bill.date}</small><span>คงเหลือ ฿{formatMoney(bill.remaining)}</span></div>
+                    <em className="normal">฿{formatMoney(bill.amount)}</em>
+                  </div>
+                ) : <div className="no-results">ยังไม่มีบิลเบิกจ่าย</div>}
+              </div>
             </div>
           </section>
         </> : <section className="panel module-panel">
-          <div className="module-toolbar"><div><h2>{active}</h2><p>จัดการข้อมูลและติดตามการดำเนินงานในระบบ ERP</p></div><div className="module-actions"><button className="btn btn-light" onClick={()=>notify('เปิดตัวกรองข้อมูล')}><Filter size={15}/> ตัวกรอง</button><button className="btn btn-primary" onClick={openCreate}><Plus size={16}/> เพิ่มรายการ</button></div></div>
-          {active.includes('โครงการ') ? <ProjectTable rows={filteredProjects} onEdit={openEdit} onDelete={deleteProject}/> : <div className="empty-module"><div className="empty-icon"><ClipboardList size={28}/></div><h3>พื้นที่จัดการ{active}</h3><p>หน้านี้เตรียมโครงสร้างไว้สำหรับพัฒนาฟังก์ชัน {active} เพิ่มเติม</p><button className="btn btn-primary" onClick={()=>notify(`เริ่มเพิ่มข้อมูล${active}`)}><Plus size={16}/> สร้างรายการแรก</button></div>}
+          <div className="module-toolbar"><div><h2>{active}</h2><p>จัดการข้อมูลและติดตามการดำเนินงานในระบบ ERP</p></div><div className="module-actions"><button className="btn btn-light" onClick={()=>notify('เปิดตัวกรองข้อมูล')}><Filter size={15}/> ตัวกรอง</button><button className="btn btn-primary" disabled={active === 'บิลเบิกจ่าย' && projects.length === 0} onClick={active === 'บิลเบิกจ่าย' ? openDisbursementCreate : openCreate}><Plus size={16}/> {active === 'บิลเบิกจ่าย' ? 'เพิ่มบิลเบิกจ่าย' : 'เพิ่มรายการ'}</button></div></div>
+          {active === 'บิลเบิกจ่าย'
+            ? projects.length
+              ? <DisbursementTable rows={disbursements.slice().reverse()} projects={projects} onEdit={openDisbursementEdit}/>
+              : <div className="empty-module"><div className="empty-icon"><Wallet size={28}/></div><h3>ยังไม่มีโครงการสำหรับเบิกจ่าย</h3><p>เพิ่มโครงการก่อน แล้วจึงบันทึกบิลเบิกจ่ายได้</p><button className="btn btn-primary" onClick={() => setActive('โครงการทั้งหมด')}><Plus size={16}/> ไปที่โครงการ</button></div>
+            : active.includes('โครงการ') ? <ProjectTable rows={filteredProjects} onEdit={openEdit} onDelete={deleteProject}/> : <div className="empty-module"><div className="empty-icon"><ClipboardList size={28}/></div><h3>พื้นที่จัดการ{active}</h3><p>หน้านี้เตรียมโครงสร้างไว้สำหรับพัฒนาฟังก์ชัน {active} เพิ่มเติม</p><button className="btn btn-primary" onClick={()=>notify(`เริ่มเพิ่มข้อมูล${active}`)}><Plus size={16}/> สร้างรายการแรก</button></div>}
         </section>}
         <footer className="footer"><span>© 2026 BALAMEE BUILDING ERP</span><span>BuildFlow ERP <b>v1.0.0</b></span></footer>
       </div>
@@ -357,6 +529,14 @@ function App() {
       <div className="form-row"><label>กำหนดส่งมอบ<input name="date" type="date"/></label></div>
       <div className="modal-actions"><button type="button" className="btn btn-light" onClick={closeProjectModal}>ยกเลิก</button><button type="submit" className="btn btn-primary">{editingProject ? <Pencil size={16}/> : <Plus size={16}/>} {editingProject ? 'บันทึกการแก้ไข' : 'บันทึกโครงการ'}</button></div>
     </form></div></div>}
+    {showDisbursementCreate && <div className="modal-backdrop" onClick={closeDisbursementModal}><div className="modal" onClick={event => event.stopPropagation()}><div className="modal-head"><div><h2>{editingDisbursement ? 'แก้ไขบิลเบิกจ่าย' : 'เพิ่มบิลเบิกจ่าย'}</h2><p>บันทึกยอดเบิกจ่ายและอัปเดตงบโครงการ</p></div><button className="icon-btn" onClick={closeDisbursementModal} aria-label="ปิด"><X size={19}/></button></div><form onSubmit={saveDisbursement}>
+      <label>โครงการ<select name="projectId" required defaultValue={editingDisbursement?.projectId || ''}><option value="" disabled>เลือกโครงการ</option>{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+      <div className="form-row"><label>ยอดเบิกจ่าย<input name="amount" type="number" min="0.01" step="0.01" required defaultValue={editingDisbursement?.amount ?? ''} placeholder="เช่น 150000"/></label><label>วันที่บิล<input name="date" type="date" required defaultValue={editingDisbursement?.date || localDateInput()}/></label></div>
+      <label>เลขที่บิล / รายละเอียด<input name="reference" defaultValue={editingDisbursement?.reference || ''} placeholder="เช่น INV-001 หรือ งวดงานที่ 1"/></label>
+      <label className="slip-upload">รูปภาพสลิป<input type="file" accept="image/*" disabled={isSlipProcessing} onChange={handleSlipUpload}/><small>{isSlipProcessing ? 'กำลังประมวลผลรูปภาพ...' : 'รองรับรูปภาพ ขนาดต้นฉบับไม่เกิน 12 MB ระบบจะย่อรูปก่อนจัดเก็บ'}</small></label>
+      {slipDraft && <div className="slip-preview"><img src={slipDraft} alt="ตัวอย่างรูปสลิป"/><button type="button" className="btn btn-light" onClick={() => setSlipDraft('')}>นำสลิปออก</button></div>}
+      <div className="modal-actions"><button type="button" className="btn btn-light" onClick={closeDisbursementModal}>ยกเลิก</button><button type="submit" className="btn btn-primary" disabled={isSlipProcessing}>{editingDisbursement ? <Pencil size={16}/> : <Plus size={16}/>} {isSlipProcessing ? 'กำลังประมวลผลรูป' : editingDisbursement ? 'บันทึกการแก้ไข' : 'บันทึกบิล'}</button></div>
+    </form></div></div>}
     {toast && <div className="toast"><CheckCircle2 size={17}/>{toast}</div>}
   </div>;
 }
@@ -365,6 +545,13 @@ function KpiCard({icon,tone,label,value,unit,note,badge,trend}) {
   return <div className="kpi-card"><div className="kpi-top"><div className={`kpi-icon ${tone}`}>{React.cloneElement(icon,{size:18})}</div><span className="kpi-label">{label}</span>{badge&&<em className="kpi-badge">{badge}</em>}</div><div className="kpi-value">{value}<small>{unit}</small></div><div className="kpi-note">{note}</div>{trend&&<div className="sparkline"><ResponsiveContainer width="100%" height="100%"><AreaChart data={trend.map((v,i)=>({i,v}))}><Area type="monotone" dataKey="v" stroke={tone==='amber'?'#c69a5c':'#2787b0'} fill={tone==='mint'?'#bceadd':'#dcecf3'} strokeWidth={1.8}/></AreaChart></ResponsiveContainer></div>}</div>
 }
 function MiniLine({values}) { return <div className="mini-line"><ResponsiveContainer width="100%" height="100%"><AreaChart data={values.map((v,i)=>({i,v}))}><Area dataKey="v" type="monotone" stroke="#d8a33d" fill="none" strokeWidth={2}/></AreaChart></ResponsiveContainer></div> }
+function DisbursementTable({rows, projects, onEdit}) {
+  return <div className="table-scroll"><table className="project-table"><thead><tr><th>เลขที่บิล</th><th>โครงการ</th><th>เลขที่บิล / รายละเอียด</th><th>วันที่</th><th>ยอดเบิกจ่าย</th><th>สลิป</th><th>จัดการ</th></tr></thead><tbody>{rows.map(bill => {
+    const project = projects.find(item => item.id === bill.projectId);
+    const date = bill.date ? new Intl.DateTimeFormat('th-TH', { day: '2-digit', month: 'short', year: 'numeric' }).format(new Date(`${bill.date}T00:00:00`)) : '-';
+    return <tr key={bill.id}><td>{bill.id}</td><td>{project?.name || bill.projectName}</td><td>{bill.reference || '-'}</td><td>{date}</td><td className="money">฿{formatMoney(bill.amount)}</td><td>{bill.slipDataUrl ? <a className="slip-link" href={bill.slipDataUrl} target="_blank" rel="noreferrer"><img src={bill.slipDataUrl} alt="" className="slip-thumbnail"/> ดูสลิป</a> : 'ไม่มีไฟล์'}</td><td><button type="button" className="table-action edit" onClick={() => onEdit(bill)} aria-label={`แก้ไขบิล ${bill.id}`} title="แก้ไข"><Pencil size={14}/></button></td></tr>;
+  })}</tbody></table>{rows.length === 0 && <div className="no-results">ยังไม่มีบิลเบิกจ่าย</div>}</div>;
+}
 function ProjectTable({rows, onEdit, onDelete}) {
   return <div className="table-scroll"><table className="project-table"><thead><tr><th>ชื่อโครงการ</th><th>ลูกค้า</th><th>ความคืบหน้า</th><th>สถานะ</th><th>มูลค่าสัญญา</th><th>งบประมาณ</th><th>เบิกจ่ายแล้ว</th><th>คงเหลือ</th><th>กำหนดส่งมอบ</th><th>จัดการ</th></tr></thead><tbody>{rows.map(p=>{
     const budget = typeof p.budgetAmount === 'number' ? p.budgetAmount : (typeof p.contractAmount === 'number' ? p.contractAmount : contractValue(p.value));
